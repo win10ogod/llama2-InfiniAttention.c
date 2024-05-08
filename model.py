@@ -22,7 +22,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     max_seq_len: int = 2048
     dropout: float = 0.0
-
+    num_future_tokens: int = 5  # 預測未來 token 的數量
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float):
@@ -91,9 +91,63 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
-class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+class CompressiveMemory(nn.Module):
+    def __init__(self, dim, memory_size=512, compression_factor=2):
+        """
+        Initialize Compressive Memory.
+        Args:
+            dim: Dimension of each memory slot.
+            memory_size: Number of memory slots.
+            compression_factor: Compression factor for older memory slots.
+        """
         super().__init__()
+        self.dim = dim
+        self.memory_size = memory_size
+        self.compression_factor = compression_factor
+        self.memory = torch.zeros(0, dim)
+
+    def compress(self, new_memory):
+        """
+        Compress older memory slots and add new memory.
+        Args:
+            new_memory: New memory slots to add.
+        """
+        if self.memory.size(0) == 0:
+            self.memory = new_memory
+        else:
+            # Concatenate new memory with existing memory
+            memory = torch.cat([self.memory, new_memory], dim=0)
+
+            # Determine the number of slots to retain
+            num_new_slots = new_memory.size(0)
+            num_old_slots = self.memory_size - num_new_slots
+
+            if num_old_slots > 0:
+                # Select the oldest slots and compress them
+                old_slots = memory[:-num_new_slots]
+                compressed_slots = old_slots.view(
+                    num_old_slots // self.compression_factor,
+                    self.compression_factor,
+                    self.dim
+                ).mean(dim=1)
+
+                # Retain compressed slots and new memory
+                self.memory = torch.cat([compressed_slots, new_memory], dim=0)
+            else:
+                # Retain only the new memory
+                self.memory = new_memory
+
+        # Ensure memory size constraint
+        if self.memory.size(0) > self.memory_size:
+            self.memory = self.memory[-self.memory_size:]
+
+    def forward(self):
+        return self.memory
+
+class InfiniAttention(nn.Module):
+    def __init__(self, args: ModelArgs, memory_size=128, compression_factor=2):
+        super().__init__()
+        self.n_heads = args.n_heads
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         assert args.n_heads % self.n_kv_heads == 0
         model_parallel_size = 1
@@ -109,6 +163,13 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
 
+        # Initialize compressive memory
+        self.compressive_memory = CompressiveMemory(
+            dim=self.head_dim * self.n_local_kv_heads,
+            memory_size=memory_size,
+            compression_factor=compression_factor
+        )
+
         # use flash attention or a manual implementation?
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -121,7 +182,7 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor,
+        freqs_sin: torch.Tensor
     ):
         bsz, seqlen, _ = x.shape
 
@@ -138,6 +199,13 @@ class Attention(nn.Module):
         xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
+        # Retrieve and combine compressive memory
+        compressive_memory = self.compressive_memory().unsqueeze(0).expand(bsz, -1, -1)
+        if compressive_memory.size(1) > 0:
+            compressive_heads = compressive_memory.view(bsz, -1, self.n_local_kv_heads, self.head_dim)
+            xk = torch.cat([compressive_heads, xk], dim=1)
+            xv = torch.cat([compressive_heads, xv], dim=1)
+
         # make heads into a batch dimension
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         xk = xk.transpose(1, 2)
@@ -145,12 +213,14 @@ class Attention(nn.Module):
 
         # flash implementation
         if self.flash:
-            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True
+            )
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = scores + self.mask[:, :, :seqlen, :xk.size(2)]  # (bs, n_local_heads, seqlen, cache_len + seqlen)
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
@@ -161,8 +231,13 @@ class Attention(nn.Module):
         # final projection into the residual stream
         output = self.wo(output)
         output = self.resid_dropout(output)
-        return output
 
+        # Update compressive memory
+        with torch.no_grad():  # Prevent gradients from being computed in memory updating
+            new_memory = xv.reshape(bsz, -1, self.head_dim * self.n_local_kv_heads).mean(dim=0)
+            self.compressive_memory.compress(new_memory)
+
+        return output
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, multiple_of: int, dropout: float):
@@ -179,19 +254,18 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
-
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.attention = Attention(args)
+        self.attention = InfiniAttention(args)
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=args.hidden_dim,
             multiple_of=args.multiple_of,
-            dropout=args.dropout,
+            dropout=args.dropout
         )
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -202,7 +276,6 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
-
 class Transformer(nn.Module):
     last_loss: Optional[torch.Tensor]
 
@@ -211,6 +284,7 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
+        self.num_future_tokens = params.num_future_tokens
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
@@ -218,10 +292,13 @@ class Transformer(nn.Module):
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        self.output_heads = nn.ModuleList([
+            nn.Linear(params.dim, params.vocab_size, bias=False) for _ in range(self.num_future_tokens)
+        ])
 
         # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
+        for head in self.output_heads:
+            head.weight = self.tok_embeddings.weight
 
         # some useful precompute for the RoPE relative positional embeddings
         freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
@@ -233,9 +310,9 @@ class Transformer(nn.Module):
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * params.n_layers))
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * params.n_layers))
 
-        # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with a targets tensor.
+        # Initialize attribute for the loss of the last forward call. This will be set if the forward is called with targets.
         self.last_loss = None
 
     def _init_weights(self, module):
@@ -258,12 +335,21 @@ class Transformer(nn.Module):
         h = self.norm(h)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.output(h)
-            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # 輸出多個未來 token 的預測
+            logits = [head(h) for head in self.output_heads]
+            logits = torch.stack(logits, dim=1)  # (batch_size, num_future_tokens, seq_len, vocab_size)
+
+            # 計算輔助損失
+            loss = 0.0
+            for i in range(self.num_future_tokens):
+                shifted_targets = targets[:, i:seqlen]  # 確保 shifted_targets 與 logits 尺寸匹配
+                logit_slice = logits[:, i, :shifted_targets.size(1), :]
+                loss += F.cross_entropy(logit_slice.reshape(-1, logit_slice.size(-1)), shifted_targets.reshape(-1), ignore_index=-1)
+            self.last_loss = loss / self.num_future_tokens
         else:
-            # inference-time mini-optimization: only forward the output on the very last position
-            logits = self.output(h[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # inference-time mini-optimization: 只預測最後的位置
+            logits = [head(h[:, [-1], :]) for head in self.output_heads]
+            logits = torch.stack(logits, dim=1)  # (batch_size, num_future_tokens, 1, vocab_size)
             self.last_loss = None
 
         return logits
